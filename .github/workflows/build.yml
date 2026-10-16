@@ -1,0 +1,40 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: 打包 Windows EXE
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 uv（读取 .python-version 与 uv.lock，带缓存）
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: 安装依赖
+        run: uv sync --frozen
+
+      - name: 运行测试
+        run: uv run pytest -q
+
+      - name: PyInstaller 打包
+        run: >
+          uv run pyinstaller --noconfirm --clean --onefile --windowed
+          --name ChajiAutoDraw --icon assets/icon.ico --add-data "assets;assets"
+          --exclude-module tests --exclude-module pytest
+          launcher.py
+
+      - name: 上传 EXE 到 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChajiAutoDraw-windows-x64
+          path: dist/ChajiAutoDraw.exe
+          if-no-files-found: error
+          retention-days: 14
