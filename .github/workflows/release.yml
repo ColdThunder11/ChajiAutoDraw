@@ -1,0 +1,77 @@
+name: Release Windows EXE
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv (uses .python-version and uv.lock, with cache)
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          v="$(uv run python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])' | tail -n 1 | tr -d '[:space:]')"
+          if [[ ! "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::Failed to parse a valid version from pyproject.toml: '$v'"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Version: $v (will be released as v$v)"
+
+      - name: Check if version is already released
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release v$VERSION already exists. Bump the version in pyproject.toml and run the workflow again."
+            exit 1
+          fi
+          if git ls-remote --tags origin "refs/tags/v$VERSION" | grep -q .; then
+            echo "::error::Tag v$VERSION already exists (may point to another commit). Bump the version in pyproject.toml and run the workflow again."
+            exit 1
+          fi
+
+      - name: Run tests
+        run: uv run pytest -q
+
+      - name: Package with PyInstaller
+        run: >
+          uv run pyinstaller --noconfirm --clean --onefile --windowed
+          --name ChajiAutoDraw --icon assets/icon.ico --add-data "assets;assets"
+          --exclude-module tests --exclude-module pytest
+          launcher.py
+
+      - name: Create release and upload EXE
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/ChajiAutoDraw.exe \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes
+          echo "Published: https://github.com/$GITHUB_REPOSITORY/releases/tag/v$VERSION"
