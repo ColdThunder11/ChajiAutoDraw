@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import QObject, QThread, Signal
 
 _VK_ESCAPE = 0x1B
+#: 每个移动点除显式延时外的标称开销（约 3ms），用于初始 ETA 与预览预估
+_STEP_OVERHEAD_S = 0.003
 
 
 def _esc_pressed() -> bool:
@@ -55,12 +57,16 @@ class DrawWorker(QThread):
 
     Signals:
         progress: (当前第几笔，从 1 开始, 总笔数)。
+        move_progress: (已完成移动数, 总移动数)。长笔画（尤其是整块
+            连续排线）可能一笔画几十秒，按笔画更新的进度条会长时间
+            不动；该信号每 0.5s 及每笔结束时发出，供进度条平滑推进。
         remaining: 预估剩余时间（整数秒），每 0.5s 至多更新一次。
         done: (是否成功完成, 消息)。QThread 自带 finished 信号，
             故完成信号命名为 done，禁止覆盖 finished。
     """
 
     progress = Signal(int, int)
+    move_progress = Signal(int, int)
     remaining = Signal(int)
     done = Signal(bool, str)
 
@@ -102,8 +108,15 @@ class DrawWorker(QThread):
         self._delay_s = max(0.0, float(delay_s))
         self._stroke_gap_s = max(0.0, float(stroke_gap_s))
         self._countdown_s = max(0.0, float(countdown_s))
+        #: 按步长插值后的总移动数（构造时算一次；run 与 UI 共用）
+        self._total_moves = estimate_moves(strokes, self._step_px)
         self._stop_event = threading.Event()
         self._stop_reason = "已手动停止"
+
+    @property
+    def total_moves(self) -> int:
+        """预计执行的鼠标移动次数（含孤立单点的补笔移动）。"""
+        return self._total_moves
 
     def stop(self) -> None:
         """线程安全地请求停止（置停止标志，run 中各步进点轮询响应）。"""
@@ -160,10 +173,8 @@ class DrawWorker(QThread):
             return
 
         total = len(self._strokes)
-        # 预期总移动数（执行时按 resample 后的点数逐点移动），用于剩余时间估算
-        total_moves = sum(
-            max(0, len(_resample(s, self._step_px)) - 1) for s in self._strokes
-        )
+        # 预期总移动数（构造时已按 resample 后的点数统计），用于进度与剩余时间
+        total_moves = self._total_moves
         pressed = False  # 当前是否处于按下状态（finally 只在按下时补一次抬起）
         last_x = 0
         last_y = 0
@@ -172,12 +183,15 @@ class DrawWorker(QThread):
         last_eta_at = t0
         # 发车即按标称值给初始估算（每步延时 + ~3ms 单步开销 + 笔间停顿），
         # 之后由实测速率持续修正，保证剩余时间从头到尾始终显示
-        nominal = total_moves * (self._delay_s + 0.003) + max(0, total - 1) * self._stroke_gap_s
+        nominal = estimate_duration(
+            total_moves, total, self._delay_s, self._stroke_gap_s
+        )
         self.remaining.emit(max(0, int(round(nominal))))
         try:
             # ②③ 后端准备与激活（准备画布窗口接收输入）
             self._backend.prepare()
             self._backend.activate()
+            self.move_progress.emit(0, total_moves)
             # ④ 逐笔绘制
             for i, stroke in enumerate(self._strokes, start=1):
                 if self._check_stop():
@@ -216,11 +230,13 @@ class DrawWorker(QThread):
                             total - i
                         ) * self._stroke_gap_s
                         self.remaining.emit(max(0, int(round(eta))))
+                        self.move_progress.emit(done_moves, total_moves)
                         last_eta_at = now
                     if self._delay_s > 0:
                         time.sleep(self._delay_s)
                 self._backend.release(last_x, last_y)
                 pressed = False
+                self.move_progress.emit(done_moves, total_moves)
                 # 笔间停顿（最后一笔后不等，避免画完还干等）
                 if self._stroke_gap_s > 0 and i < total:
                     if not self._wait_gap():
@@ -228,6 +244,7 @@ class DrawWorker(QThread):
                         return
 
             elapsed = time.monotonic() - t0
+            self.move_progress.emit(total_moves, total_moves)
             self.done.emit(True, f"绘制完成，共 {total} 笔，用时 {self._fmt_duration(elapsed)}")
         except RuntimeError as e:
             # 后端业务失败（含 UIPI 拒绝、前台急停），消息已是中文可直接展示
@@ -268,3 +285,34 @@ def _resample(
             t = k / steps
             out.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
     return out
+
+
+def estimate_moves(
+    strokes: list[list[tuple[int, int]]],
+    step_px: float,
+) -> int:
+    """估算实际鼠标移动次数（与 DrawWorker.run 的移动序列一致）。
+
+    单点笔画在 run 中会补一次 1px 的按下移动，其余笔画按插值点数减一
+    计；空笔画跳过。构造 DrawWorker 与 UI 预估共用本函数，避免两套
+    计数口径不一致。
+    """
+    total = 0
+    for stroke in strokes:
+        if not stroke:
+            continue
+        points = _resample(stroke, step_px)
+        total += 1 if len(points) == 1 else len(points) - 1
+    return total
+
+
+def estimate_duration(
+    total_moves: int,
+    stroke_count: int,
+    delay_s: float,
+    stroke_gap_s: float,
+) -> float:
+    """标称绘制耗时（秒）：移动数 ×（步延时 + 单步开销）+ 笔间停顿。"""
+    return total_moves * (
+        max(0.0, float(delay_s)) + _STEP_OVERHEAD_S
+    ) + max(0, int(stroke_count) - 1) * max(0.0, float(stroke_gap_s))

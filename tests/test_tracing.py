@@ -3,6 +3,7 @@
 import math
 
 import numpy as np
+from PIL import Image, ImageDraw
 
 from chaji_autodraw.core.tracing import (
     count_points,
@@ -235,15 +236,79 @@ def test_extend_without_mask_follows_stroke_direction() -> None:
     assert path_length(out[0]) == 6.0
 
 
-def test_extend_fallback_when_no_black_nearby() -> None:
-    """周围全白（无可延伸黑色区域）：回退为原地往返拖拽。"""
+def test_stroke_reach_uses_farthest_point_from_press() -> None:
+    """有效拖拽距离 = 首点到最远点；往返/绕圈不能用路径总长代替。"""
+    from chaji_autodraw.core.tracing import path_length, stroke_reach
+
+    assert stroke_reach([(0, 0)]) == 0.0
+    assert stroke_reach([(0, 0), (3, 4)]) == 5.0
+    back = [(0, 0), (3, 0), (0, 0)]
+    assert path_length(back) == 6.0
+    assert stroke_reach(back) == 3.0  # 路径够长但最远点不够
+
+
+def test_extend_uses_reach_not_path_length() -> None:
+    """路径总长已达标、但有效拖拽距离不足的笔画仍必须延伸。"""
     import numpy as np
 
-    from chaji_autodraw.core.tracing import extend_short_strokes
+    from chaji_autodraw.core.tracing import (
+        extend_short_strokes,
+        path_length,
+        stroke_reach,
+    )
+
+    stroke = [(10, 10), (13, 10), (10, 10)]  # 路径 6px，最远仅 3px
+    assert path_length(stroke) >= 6.0
+    out = extend_short_strokes(
+        [stroke], 6.0, np.zeros((100, 100), dtype=bool)
+    )
+    assert out[0][0] == (10, 10)  # 按下点不变
+    assert stroke_reach(out[0]) >= 5.5  # 最远点被补到目标距离
+    for point in stroke:
+        assert point in out[0]  # 原路径仍保留
+
+
+def test_extend_no_black_still_reaches_target() -> None:
+    """周围全白时也必须延伸到达标位移，不能回退成原地往返。"""
+    import numpy as np
+
+    from chaji_autodraw.core.tracing import extend_short_strokes, stroke_reach
 
     mask = np.zeros((100, 100), dtype=bool)
     out = extend_short_strokes([[(50, 50), (53, 50)]], 6.0, mask)
-    assert out == [[(50, 50), (53, 50), (50, 50)]]
+    stroke = out[0]
+    assert stroke[0] == (50, 50)
+    assert stroke[-1] != (50, 50)  # 不是原地往返
+    assert stroke_reach(stroke) >= 6.0
+
+
+def test_extend_diagonal_rounding_still_reaches_target() -> None:
+    """斜向端点取整后若略短，必须补点保证有效距离达到 min_length。"""
+    import numpy as np
+
+    from chaji_autodraw.core.tracing import extend_short_strokes, stroke_reach
+
+    mask = np.zeros((30, 30), dtype=bool)
+    out = extend_short_strokes([[(10, 10), (11, 11)]], 6.0, mask)
+    assert stroke_reach(out[0]) >= 6.0
+
+
+def test_extend_pipeline_all_strokes_reach_target() -> None:
+    """混合短笔/单点/往返笔：延伸后全部达到最小有效拖拽距离。"""
+    import numpy as np
+
+    from chaji_autodraw.core.tracing import extend_short_strokes, stroke_reach
+
+    strokes = [
+        [(0, 0), (3, 0), (0, 0)],   # 往返
+        [(10, 10)],                  # 单点
+        [(20, 20), (23, 20)],        # 普通短笔
+    ]
+    out = extend_short_strokes(
+        strokes, 6.0, np.zeros((60, 60), dtype=bool)
+    )
+    assert len(out) == len(strokes)
+    assert all(stroke_reach(s) >= 5.5 for s in out)
 
 
 def test_extend_short_strokes_zero_threshold_identity() -> None:
@@ -260,6 +325,14 @@ def test_connect_nearby_merges_1px_gap() -> None:
 
     out = connect_nearby_strokes([[(0, 0), (5, 0)], [(6, 0), (10, 0)]], 1.5)
     assert out == [[(0, 0), (5, 0), (6, 0), (10, 0)]]
+
+
+def test_connect_nearby_default_gap_is_three() -> None:
+    """函数默认连接距离为 3px：2px 间隙不传参也应合并。"""
+    from chaji_autodraw.core.tracing import connect_nearby_strokes
+
+    out = connect_nearby_strokes([[(0, 0), (5, 0)], [(7, 0), (10, 0)]])
+    assert out == [[(0, 0), (5, 0), (7, 0), (10, 0)]]
 
 
 def test_connect_nearby_reverses_second_stroke() -> None:
@@ -338,20 +411,31 @@ def test_hand_drawn_ring_stays_walkable() -> None:
 
 
 def test_hand_drawn_blob_filled_with_hatch() -> None:
-    """实心大块：改为排线填涂——出现多条近水平笔画（牛耕式往返）。"""
+    """实心大块：连续牛耕排线铺满，笔画数很少且覆盖率足够。
+
+    新排线按主轴/斜向连续往返（尽量不抬笔），不再是多条水平线；
+    因此以「笔画数少 + 光栅化覆盖率」判断，而不是排线方向。
+    """
     from chaji_autodraw.core.tracing import trace_hand_drawn_paths
 
     mask = np.zeros((120, 120), dtype=bool)
     mask[20:100, 20:100] = True  # 80x80 实心色块
     strokes = trace_hand_drawn_paths(mask, min_step=2.0, pen_width=3)
-    assert len(strokes) >= 4
-    horizontal = [
-        s for s in strokes
-        if len(s) >= 2 and abs(s[0][1] - s[-1][1]) <= 3  # 近水平排线
-    ]
-    assert len(horizontal) >= 3
-    rows = {p[1] for s in horizontal for p in s}
-    assert len(rows) >= 20  # 排线铺满色块纵向
+    assert 1 <= len(strokes) <= 5  # 连续排线，不再拆成大量碎笔
+    assert max(len(s) for s in strokes) >= 100
+
+    img = Image.new("RGB", (120, 120), "white")
+    draw = ImageDraw.Draw(img)
+    for s in strokes:
+        draw.line(
+            [(float(x), float(y)) for x, y in s],
+            fill=(0, 0, 0),
+            width=3,
+            joint="curve",
+        )
+    painted = np.asarray(img.convert("L")) < 128
+    covered = (painted & mask).sum() / mask.sum()
+    assert covered >= 0.95  # 排线重叠足够，涂黑基本没有白缝
 
 
 def test_hand_drawn_empty_mask() -> None:
@@ -372,6 +456,46 @@ def test_hand_drawn_diagonal_survives() -> None:
     strokes = trace_hand_drawn_paths(mask, min_step=2.0)
     pts = [p for s in strokes for p in s]
     assert len(pts) > 40  # 斜线未塌缩
+
+
+def test_hand_drawn_arc_is_continuous() -> None:
+    """重点回归：陡/缓弧线都应画成连续长笔，不产生孤立短笔画。
+
+    骨架在斜向圆弧上会留下大量 2~3px 梯格碎片；新流程用掩膜内
+    桥接把这些碎片接回主笔。每种朝向下都要求：至少一笔超过 200px，
+    少于 4px 的孤立碎笔为 0，整条弧最多 2 笔（骨架偶有并行双轨）。
+    """
+    from chaji_autodraw.core.tracing import trace_hand_drawn_paths
+
+    for start, end in ((0, 120), (60, 180), (120, 240), (210, 330)):
+        im = Image.new("L", (300, 300), 255)
+        ImageDraw.Draw(im).arc(
+            (40, 40, 260, 260), start, end, fill=0, width=5
+        )
+        mask = np.asarray(im) < 128
+        strokes = trace_hand_drawn_paths(
+            mask, min_step=2.0, pen_width=1
+        )
+        assert max(path_length(s) for s in strokes) > 200, (
+            f"弧 {start}-{end} 未形成连续长笔"
+        )
+        assert not [
+            s for s in strokes if path_length(s) < 4.0
+        ], f"弧 {start}-{end} 仍有孤立短笔画"
+        assert len(strokes) <= 2, f"弧 {start}-{end} 被拆成了多笔"
+
+
+def test_connect_through_mask_respects_background() -> None:
+    """端点桥接只走掩膜内部：背景缺口不连，补上黑色连接带后才连。"""
+    from chaji_autodraw.core.tracing import _connect_strokes_through_mask
+
+    strokes = [[(5, 17), (34, 17)], [(45, 17), (74, 17)]]
+    mask = np.zeros((40, 80), dtype=bool)
+    mask[15:20, 5:35] = True
+    mask[15:20, 45:75] = True
+    assert len(_connect_strokes_through_mask(strokes, mask, max_gap=12)) == 2
+    mask[15:20, 35:45] = True  # 两段之间是原图黑色：可以桥接
+    assert len(_connect_strokes_through_mask(strokes, mask, max_gap=12)) == 1
 
 
 def test_blob_region_rejects_line_junction_thickening() -> None:
@@ -451,3 +575,142 @@ def test_fill_sensitivity_controls_eye_stroke() -> None:
 
     th_lo = _fill_ratio_from_sensitivity(0.0)
     assert _blob_region(eye, th_lo).sum() == 0  # 归零：眼睛也按线条
+
+
+# ---- 3-4 chamfer 距离变换（两遍扫描 vs 迭代参考实现）----
+
+def _reference_chamfer(mask: np.ndarray) -> np.ndarray:
+    """同步迭代的 3-4 chamfer（小掩膜专用，作为两遍扫描的对照）。"""
+    h, w = mask.shape
+    inf = 1 << 20
+    d = np.where(mask, inf, 0).astype(np.int32)
+    for _ in range(h * w + 2):
+        prev = d.copy()
+        md = d.copy()
+        for dy, dx, cost in (
+            (0, -1, 3), (0, 1, 3), (-1, 0, 3), (1, 0, 3),
+            (-1, -1, 4), (-1, 1, 4), (1, -1, 4), (1, 1, 4),
+        ):
+            shifted = np.full_like(d, inf)
+            ys0, ys1 = max(0, -dy), min(h, h - dy)
+            xs0, xs1 = max(0, -dx), min(w, w - dx)
+            shifted[ys0:ys1, xs0:xs1] = np.minimum(
+                inf, d[ys0 + dy : ys1 + dy, xs0 + dx : xs1 + dx] + cost
+            )
+            md = np.minimum(md, shifted)
+        d = md
+        if np.array_equal(d, prev):
+            break
+    return d
+
+
+def test_chamfer_distance_matches_iterative_reference() -> None:
+    """两遍扫描必须与旧迭代实现逐位一致（含高厚色块/边界/随机掩膜）。"""
+    from chaji_autodraw.core.tracing import _chamfer_distance
+
+    masks = [np.zeros((7, 9), dtype=bool), np.ones((7, 9), dtype=bool)]
+    masks.append(np.eye(6, dtype=bool))
+    single = np.zeros((9, 9), dtype=bool)
+    single[4, 4] = True
+    masks.append(single)
+    block = np.zeros((9, 9), dtype=bool)
+    block[2:7, 2:7] = True
+    masks.append(block)
+    border = np.zeros((9, 9), dtype=bool)
+    border[:, 4] = True
+    masks.append(border)
+
+    rng = np.random.default_rng(2026)
+    for _ in range(40):
+        h = int(rng.integers(1, 25))
+        w = int(rng.integers(1, 25))
+        masks.append(rng.random((h, w)) < rng.uniform(0.05, 0.95))
+
+    for mask in masks:
+        got = _chamfer_distance(mask)
+        want = _reference_chamfer(mask)
+        assert got.dtype == np.int32
+        assert got.shape == mask.shape
+        assert np.array_equal(got, want)
+
+
+def test_chamfer_distance_single_pixel_distance() -> None:
+    """单个前景像素到最近背景的 3-4 chamfer 距离为 3。"""
+    from chaji_autodraw.core.tracing import _chamfer_distance
+
+    mask = np.zeros((5, 5), dtype=bool)
+    mask[2, 2] = True
+    distances = _chamfer_distance(mask)
+    assert int(distances[2, 2]) == 3
+
+
+# ---- 8 连通分量（行程 + 并查集 vs 逐像素 BFS）----
+
+def _reference_components(mask: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    """逐像素 BFS 的 8 连通分量（小掩膜对照实现）。"""
+    h, w = mask.shape
+    remaining = mask.copy()
+    out: list[tuple[np.ndarray, np.ndarray]] = []
+    ys, xs = np.nonzero(remaining)
+    for y0, x0 in zip(ys, xs):
+        if not remaining[y0, x0]:
+            continue
+        stack = [(int(y0), int(x0))]
+        remaining[y0, x0] = False
+        comp_ys: list[int] = []
+        comp_xs: list[int] = []
+        while stack:
+            cy, cx = stack.pop()
+            comp_ys.append(cy)
+            comp_xs.append(cx)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < h and 0 <= nx < w and remaining[ny, nx]:
+                        remaining[ny, nx] = False
+                        stack.append((ny, nx))
+        out.append((np.asarray(comp_ys), np.asarray(comp_xs)))
+    return out
+
+
+def test_components_match_bfs_reference() -> None:
+    """行程并查集必须与逐像素 BFS 得到完全相同的 8 连通分组。"""
+    from chaji_autodraw.core.tracing import _core_components
+
+    masks = [np.zeros((6, 7), dtype=bool), np.ones((6, 7), dtype=bool)]
+    single = np.zeros((5, 5), dtype=bool)
+    single[2, 2] = True
+    masks.append(single)
+    diagonal = np.zeros((4, 4), dtype=bool)  # 仅对角相邻：8 连通算一组
+    diagonal[0, 0] = True
+    diagonal[1, 1] = True
+    masks.append(diagonal)
+    separated = np.zeros((8, 8), dtype=bool)
+    separated[1:3, 1:3] = True
+    separated[5:7, 5:7] = True
+    masks.append(separated)
+    border = np.zeros((7, 7), dtype=bool)
+    border[:, 0] = True
+    border[3, :] = True
+    masks.append(border)
+
+    rng = np.random.default_rng(2026)
+    for _ in range(50):
+        h = int(rng.integers(1, 28))
+        w = int(rng.integers(1, 28))
+        masks.append(rng.random((h, w)) < rng.uniform(0.05, 0.95))
+
+    for mask in masks:
+        got = _core_components(mask)
+        want = _reference_components(mask)
+        assert len(got) == len(want)
+        for (gy, gx), (wy, wx) in zip(got, want):
+            assert set(zip(gy.tolist(), gx.tolist())) == set(
+                zip(wy.tolist(), wx.tolist())
+            )
+        if got:
+            # 分量顺序保持扫描顺序：第一组包含最上（同行为最左）的像素
+            fy, fx = np.argwhere(mask)[0]
+            assert (int(fy), int(fx)) in set(
+                zip(got[0][0].tolist(), got[0][1].tolist())
+            )

@@ -74,6 +74,37 @@ def test_resample_single_point_stroke() -> None:
     assert _resample([(7, 9)], 3.0) == [(7.0, 9.0)]
 
 
+def test_estimate_moves_counts_single_point_nudge() -> None:
+    """移动数口径：单点笔画补一次按下移动，空笔画不计。"""
+    from chaji_autodraw.core.drawer import estimate_duration, estimate_moves
+
+    assert estimate_moves([[(0, 0), (10, 0)]], 5.0) == 2
+    assert estimate_moves([[(5, 5)]], 5.0) == 1
+    assert estimate_moves([[]], 5.0) == 0
+    # 39 次移动、1 笔、每步 6ms：39 × (0.006 + 0.003)
+    assert estimate_duration(39, 1, 0.006, 0.0) == pytest.approx(0.351)
+
+
+def test_move_progress_signal_reaches_total(
+    monkeypatch: pytest.MonkeyPatch, qapp: object
+) -> None:
+    """移动点进度从 0 单调推进到总数（长笔画进度条依赖该信号）。"""
+    monkeypatch.setattr(drawer, "_esc_pressed", lambda: False)
+    backend = _FakeBackend()
+    strokes = [[(0, 0), (10, 0)], [(0, 5)]]
+    worker = DrawWorker(
+        strokes, 0, 0, backend, step_px=5.0, delay_s=0.0, countdown_s=0.0
+    )
+    assert worker.total_moves == 3  # 2 次移动 + 单点补笔 1 次
+    events: list[tuple[int, int]] = []
+    worker.move_progress.connect(lambda done, total: events.append((done, total)))
+    worker.run()
+    assert events[0] == (0, worker.total_moves)
+    assert events[-1] == (worker.total_moves, worker.total_moves)
+    done_values = [done for done, _ in events]
+    assert done_values == sorted(done_values)  # 单调不减
+
+
 def test_resample_two_point_segment_spacing() -> None:
     """两点线段按步长插值：首尾必达，相邻点距不超过步长。"""
     out = _resample([(0, 0), (9, 0)], 3.0)

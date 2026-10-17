@@ -1,6 +1,6 @@
 [project]
 name = "chaji-autodraw"
-version = "1.1.0"
+version = "1.1.1"
 description = "霸王茶姬小程序自定义杯贴自动绘制工具"
 license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.11"
