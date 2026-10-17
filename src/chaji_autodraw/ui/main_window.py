@@ -42,6 +42,7 @@ from chaji_autodraw.core.input_backends import (
 )
 from chaji_autodraw.core.tracing import (
     connect_nearby_strokes,
+    trace_hand_drawn_paths,
     count_points,
     deduplicate_strokes,
     extend_short_strokes,
@@ -94,6 +95,14 @@ _LABEL_TIPS: dict[str, str] = {
         "掩码再按面积覆盖率缩放到画布——框选画布前后检测效果一致，窄阴影带不会因缩放漏判、"
         "细线不丢失。关闭后与旧版相同：先把图片缩放到画布分辨率再检测，超大图上更快，"
         "但缩放可能改变阴影剔除的几何判定（阴影边界可能漏滤成多余线条）。",
+    "手绘模拟": "不按描边填充绘制，而是把线条骨架化为中心线后沿线条走向运笔，并模拟人类笔迹"
+        "（低频手抖、起笔提前与收笔小过冲）。相当粗的黑色色块（约 ≥9px 宽且核心面积占邻域主导，发尖角/双线重叠等局部加厚仍按线条画）自动改为排线填涂："
+        "按画笔粗细为间距的牛耕式往返折线（像人涂阴影，尽量不抬笔），色块轮廓仍先描边。"
+        "线条模式与二值化模式均可用；随机效果使用固定种子，预览与实际绘制完全一致。",
+    "涂色灵敏度": "手绘模拟的色块判定严格程度（0~100，默认 65）：越大越多粗笔画区域被按色块"
+        "排线涂色（如眯眼式的粗黑眼睛笔画，占比阈值越低）；越小越严格，只有大面积实心色块才涂色、"
+        "线条交角/双线重叠等局部加厚一律按线条画。眯眼等粗笔画没被涂色时调大，"
+        "线条交汇处被错误涂黑时调小。",
     "窗口关键词": "窗口标题包含该文字才会被检测，例如“霸王茶姬”。",
     "进程名": "窗口须属于该进程（默认 WeChatAppEx.exe，微信小程序）才会自动选中；"
         "多个同进程窗口时取面积最大的主窗口。留空则仅按标题匹配。",
@@ -319,8 +328,8 @@ class MainWindow(QMainWindow):
         )
         form.addWidget(self._invert_check)
 
-        # 短笔画重复拖拽（防位移过短画布不落笔）
-        exp_row = QHBoxLayout()
+        # 笔画规划选项一行：短笔画延伸拖拽 / 自动连接相近线条 / 手绘模拟
+        plan_row = QHBoxLayout()
         self._mindrag_check = QCheckBox("短笔画延伸拖拽", form_area)
         self._mindrag_check.setChecked(True)
         self._mindrag_check.setToolTip(
@@ -328,38 +337,52 @@ class MainWindow(QMainWindow):
             "「最小拖拽」的短笔画自动沿最优方向延伸（优先延伸进就近的已涂黑"
             "区域，溢出无痕迹；附近无黑色时回退原地往返）。"
         )
-        exp_row.addWidget(self._mindrag_check)
-        exp_row.addWidget(_tip_label("最小拖拽", form_area))
+        plan_row.addWidget(self._mindrag_check)
+        plan_row.addWidget(_tip_label("最小拖拽", form_area))
         self._mindrag_spin = QSpinBox(form_area)
         self._mindrag_spin.setRange(3, 20)
         self._mindrag_spin.setValue(6)
         self._mindrag_spin.setSuffix(" px")
-        exp_row.addWidget(self._mindrag_spin)
-        exp_row.addStretch(1)
-        self._mindrag_spin.setEnabled(self._mindrag_check.isChecked())
-        self._mindrag_check.toggled.connect(self._mindrag_spin.setEnabled)
-        form_col.addLayout(exp_row)
-
-        # 自动连接相近线条（减少落笔次数）
-        conn_row = QHBoxLayout()
+        plan_row.addWidget(self._mindrag_spin)
         self._connect_check = QCheckBox("自动连接相近线条", form_area)
         self._connect_check.setChecked(True)
         self._connect_check.setToolTip(
             "端点距离不超过「连接距离」的相邻笔画首尾相连成一笔，"
             "减少落笔次数；对追踪器拆散的 1px 间隙线条尤其有效。"
         )
-        conn_row.addWidget(self._connect_check)
-        conn_row.addWidget(_tip_label("连接距离", form_area))
+        plan_row.addWidget(self._connect_check)
+        plan_row.addWidget(_tip_label("连接距离", form_area))
         self._connect_gap_spin = QDoubleSpinBox(form_area)
         self._connect_gap_spin.setRange(0.5, 5.0)
         self._connect_gap_spin.setSingleStep(0.5)
         self._connect_gap_spin.setValue(1.5)
         self._connect_gap_spin.setSuffix(" px")
-        conn_row.addWidget(self._connect_gap_spin)
-        conn_row.addStretch(1)
+        plan_row.addWidget(self._connect_gap_spin)
+        # 手绘模拟：骨架中心线 + 人类化笔迹（两种模式通用）
+        self._handdrawn_check = QCheckBox("手绘模拟", form_area)
+        self._handdrawn_check.setChecked(False)
+        self._handdrawn_check.setToolTip(_LABEL_TIPS["手绘模拟"])
+        plan_row.addWidget(self._handdrawn_check)
+        self._fill_sens_label = _tip_label("涂色灵敏度", form_area)
+        plan_row.addWidget(self._fill_sens_label)
+        self._fill_sens_slider = QSlider(Qt.Orientation.Horizontal, form_area)
+        self._fill_sens_slider.setRange(0, 100)
+        self._fill_sens_slider.setValue(65)
+        self._fill_sens_slider.setFixedWidth(80)
+        plan_row.addWidget(self._fill_sens_slider)
+        self._fill_sens_value = QLabel("65", form_area)
+        self._fill_sens_value.setMinimumWidth(24)
+        plan_row.addWidget(self._fill_sens_value)
+        plan_row.addStretch(1)
+        # 初始未勾选手绘模拟：禁用（toggle 时由 _sync_fill_sens_enabled 同步）
+        self._fill_sens_slider.setEnabled(False)
+        self._fill_sens_label.setEnabled(False)
+        self._fill_sens_value.setEnabled(False)
+        self._mindrag_spin.setEnabled(self._mindrag_check.isChecked())
+        self._mindrag_check.toggled.connect(self._mindrag_spin.setEnabled)
         self._connect_gap_spin.setEnabled(self._connect_check.isChecked())
         self._connect_check.toggled.connect(self._connect_gap_spin.setEnabled)
-        form_col.addLayout(conn_row)
+        form_col.addLayout(plan_row)
 
         # 线条模式（彩色插画）：DoG 线稿提取替代阈值二值化
         line_row = QHBoxLayout()
@@ -370,17 +393,17 @@ class MainWindow(QMainWindow):
             "只画线条不涂色块；开启后「阈值/反相」不参与，线条色块将不再被涂黑。"
         )
         line_row.addWidget(self._line_mode_check)
-        # 全分辨率处理：线条模式检测（DoG+阴影剔除）在原图分辨率执行
-        self._fullres_check = QCheckBox("全分辨率处理", form_area)
-        self._fullres_check.setChecked(True)
-        self._fullres_check.setToolTip(_LABEL_TIPS["全分辨率处理"])
-        line_row.addWidget(self._fullres_check)
         self._line_thresh_label = _tip_label("线条阈值", form_area)
         line_row.addWidget(self._line_thresh_label)
         self._line_thresh_spin = QSpinBox(form_area)
         self._line_thresh_spin.setRange(1, 60)
         self._line_thresh_spin.setValue(12)
         line_row.addWidget(self._line_thresh_spin)
+        # 全分辨率处理：线条模式检测（DoG+阴影剔除）在原图分辨率执行
+        self._fullres_check = QCheckBox("全分辨率处理", form_area)
+        self._fullres_check.setChecked(True)
+        self._fullres_check.setToolTip(_LABEL_TIPS["全分辨率处理"])
+        line_row.addWidget(self._fullres_check)
         # 阴影剔除：过滤光影分界线（默认关闭，可勾选开启）；
         # 右侧紧跟「保护强度」短滑条
         self._shadow_check = QCheckBox("阴影剔除", form_area)
@@ -525,6 +548,9 @@ class MainWindow(QMainWindow):
         self._shadow_check.toggled.connect(self._sync_shadow_prot_enabled)
         self._shadow_prot_slider.valueChanged.connect(self._on_params_changed)
         self._fullres_check.toggled.connect(self._on_params_changed)
+        self._handdrawn_check.toggled.connect(self._on_params_changed)
+        self._handdrawn_check.toggled.connect(self._sync_fill_sens_enabled)
+        self._fill_sens_slider.valueChanged.connect(self._on_params_changed)
         self._invert_check.toggled.connect(self._on_params_changed)
         # 右栏
         self._detect_btn.clicked.connect(self._detect_windows)
@@ -555,6 +581,14 @@ class MainWindow(QMainWindow):
         self._blur_value.setText(f"{self._blur_slider.value() / 10.0:.1f}")
         self._thin_value.setText(f"{self._thin_slider.value()} px")
         self._shadow_prot_value.setText(str(self._shadow_prot_slider.value()))
+        self._fill_sens_value.setText(str(self._fill_sens_slider.value()))
+
+    def _sync_fill_sens_enabled(self) -> None:
+        """涂色灵敏度滑条仅在勾选手绘模拟时可用。"""
+        enabled = self._handdrawn_check.isChecked()
+        self._fill_sens_slider.setEnabled(enabled)
+        self._fill_sens_label.setEnabled(enabled)
+        self._fill_sens_value.setEnabled(enabled)
 
     def _sync_shadow_prot_enabled(self) -> None:
         """保护强度滑条仅在线条模式开启且勾选阴影剔除时可用。"""
@@ -644,7 +678,15 @@ class MainWindow(QMainWindow):
             target_h=target[1] if target else None,
             rgb=self._rgb,
         )
-        strokes = trace_paths(mask, min_step=float(self._thin_slider.value()))
+        if self._handdrawn_check.isChecked():
+            strokes = trace_hand_drawn_paths(
+                mask,
+                min_step=float(self._thin_slider.value()),
+                pen_width=int(self._pensize_spin.value()),
+                fill_sensitivity=float(self._fill_sens_slider.value()),
+            )
+        else:
+            strokes = trace_paths(mask, min_step=float(self._thin_slider.value()))
         if target is not None:
             strokes = filter_strokes(
                 strokes, float(self._minstroke_spin.value())

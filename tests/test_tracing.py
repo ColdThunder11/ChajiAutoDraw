@@ -287,3 +287,167 @@ def test_connect_nearby_chain_of_three() -> None:
     )
     assert len(out) == 1
     assert out[0][0] == (0, 0) and out[0][-1] == (10, 0)
+
+
+# ---- 手绘模拟（骨架中心线 + 人类化笔迹）----
+
+def test_hand_drawn_follows_line_direction() -> None:
+    """粗竖条：笔画沿竖直中心线（x 聚焦在条中心 ±1.5px），而非描边。"""
+    from chaji_autodraw.core.tracing import trace_hand_drawn_paths
+
+    mask = np.zeros((120, 120), dtype=bool)
+    mask[10:110, 58:66] = True  # 8px 宽竖条，中心 x=62
+    strokes = trace_hand_drawn_paths(mask, min_step=2.0)
+    assert 1 <= len(strokes) <= 4
+    xs = [p[0] for s in strokes for p in s]
+    assert 58 <= min(xs) and max(xs) <= 65  # 聚焦中心线
+    for s in strokes:
+        ys = [p[1] for p in s]
+        assert max(ys) - min(ys) > 30  # 沿竖直方向运笔
+
+
+def test_hand_drawn_is_deterministic() -> None:
+    """固定随机种子：同一掩膜两次调用结果完全一致（预览即实绘）。"""
+    from chaji_autodraw.core.tracing import trace_hand_drawn_paths
+
+    mask = np.zeros((80, 80), dtype=bool)
+    mask[10:70, 38:42] = True
+    mask[30:34, 10:70] = True
+    a = trace_hand_drawn_paths(mask, min_step=2.0)
+    b = trace_hand_drawn_paths(mask, min_step=2.0)
+    assert a == b
+    assert a  # 非空
+
+
+def test_hand_drawn_ring_stays_walkable() -> None:
+    """厚圆环：骨架保持完整可走（按应用链路=过滤+连接后笔画数有限）。"""
+    from chaji_autodraw.core.tracing import (
+        connect_nearby_strokes,
+        filter_strokes,
+        trace_hand_drawn_paths,
+    )
+
+    yy, xx = np.mgrid[:120, :120]
+    r2 = (xx - 60) ** 2 + (yy - 60) ** 2
+    mask = (r2 > 36**2) & (r2 < 44**2)
+    strokes = trace_hand_drawn_paths(mask, min_step=2.0)
+    assert max(len(s) for s in strokes) >= 40  # 至少一段长弧
+    # 应用实际绘制链路：碎片段被端点连接合并
+    chained = connect_nearby_strokes(filter_strokes(strokes, 2.0), 1.5)
+    assert len(chained) <= 25
+
+
+def test_hand_drawn_blob_filled_with_hatch() -> None:
+    """实心大块：改为排线填涂——出现多条近水平笔画（牛耕式往返）。"""
+    from chaji_autodraw.core.tracing import trace_hand_drawn_paths
+
+    mask = np.zeros((120, 120), dtype=bool)
+    mask[20:100, 20:100] = True  # 80x80 实心色块
+    strokes = trace_hand_drawn_paths(mask, min_step=2.0, pen_width=3)
+    assert len(strokes) >= 4
+    horizontal = [
+        s for s in strokes
+        if len(s) >= 2 and abs(s[0][1] - s[-1][1]) <= 3  # 近水平排线
+    ]
+    assert len(horizontal) >= 3
+    rows = {p[1] for s in horizontal for p in s}
+    assert len(rows) >= 20  # 排线铺满色块纵向
+
+
+def test_hand_drawn_empty_mask() -> None:
+    """空掩膜返回空列表。"""
+    from chaji_autodraw.core.tracing import trace_hand_drawn_paths
+
+    assert trace_hand_drawn_paths(np.zeros((10, 10), dtype=bool)) == []
+
+
+def test_hand_drawn_diagonal_survives() -> None:
+    """回归：经典并行细化（Zhang-Suen）会把 45° 斜线整体腐蚀掉；
+    串行+中轴保护的实现必须保留斜线走向。"""
+    from chaji_autodraw.core.tracing import trace_hand_drawn_paths
+
+    mask = np.zeros((100, 100), dtype=bool)
+    for k in range(90):
+        mask[k, k : k + 3] = True
+    strokes = trace_hand_drawn_paths(mask, min_step=2.0)
+    pts = [p for s in strokes for p in s]
+    assert len(pts) > 40  # 斜线未塌缩
+
+
+def test_blob_region_rejects_line_junction_thickening() -> None:
+    """回归：发尖角/双线短重叠的局部加厚不再被误判为色块。
+
+    旧判定只看局部宽度（≥9px），线条交角内侧与重叠段会被错误排线
+    涂色；新判定加「核心面积 + 邻域占比」上下文——真色块的核心在
+    邻域掩膜中占主导，线条结构周围线条像素占绝大多数。
+    """
+    from chaji_autodraw.core.tracing import _blob_region
+
+    # 发尖角：两条 5px 线呈 V 形相交，内侧局部宽度超阈值
+    corner = np.zeros((120, 120), dtype=bool)
+    for k in range(90):
+        y = 10 + k
+        corner[y, 10 + k : 15 + k] = True
+        corner[y, 105 - k : 110 - k] = True
+    assert _blob_region(corner).sum() == 0
+
+    # 双线短距离重叠：6px 竖线中段与另一条并拢成 12px 宽
+    overlap = np.zeros((140, 140), dtype=bool)
+    overlap[10:130, 30:36] = True
+    overlap[50:90, 36:42] = True
+    assert _blob_region(overlap).sum() == 0
+
+    # 10px 宽长粗笔画：按线条运笔而非色块
+    thick = np.zeros((140, 140), dtype=bool)
+    thick[10:130, 60:70] = True
+    assert _blob_region(thick).sum() == 0
+
+
+def test_blob_region_still_detects_real_blobs() -> None:
+    """真色块（含附着细线的场景）仍被正确检出且不卷入细线。"""
+    from chaji_autodraw.core.tracing import _blob_region
+
+    blob = np.zeros((120, 120), dtype=bool)
+    blob[20:100, 20:100] = True
+    assert _blob_region(blob).sum() > 5000
+
+    mix = np.zeros((140, 140), dtype=bool)
+    mix[40:100, 40:100] = True  # 60x60 色块
+    mix[10:40, 66:74] = True    # 上方 8px 细线
+    region = _blob_region(mix)
+    assert region.sum() > 3000
+    # 细线上段（远离交汇处）不被卷入；交汇处局部真实变宽，
+    # 允许 ~5px 的过渡尾巴
+    assert region[:30, :].sum() == 0
+    assert region[:40, :].sum() < 100
+
+
+def test_fill_sensitivity_controls_eye_stroke() -> None:
+    """涂色灵敏度：默认 65 时「眯眼式」粗黑弧笔画被涂色（用户场景），
+    双线重叠仍按线条；灵敏度拉满后重叠也涂、归零后眼睛也按线条。"""
+    from chaji_autodraw.core.tracing import (
+        _blob_region,
+        _fill_ratio_from_sensitivity,
+    )
+
+    def disk(m, cx, cy, r):
+        yy, xx = np.mgrid[: m.shape[0], : m.shape[1]]
+        m[(yy - cy) ** 2 + (xx - cx) ** 2 <= r * r] = True
+
+    eye = np.zeros((100, 100), dtype=bool)
+    for k in range(40):
+        a = np.pi * k / 39
+        disk(eye, int(round(50 - 20 * np.cos(a))), int(round(50 - 8 * np.sin(a))), 6)
+    overlap = np.zeros((140, 140), dtype=bool)
+    overlap[10:130, 30:36] = True
+    overlap[50:90, 36:42] = True
+
+    th = _fill_ratio_from_sensitivity(65.0)
+    assert _blob_region(eye, th).sum() > 0  # 默认：眯眼弧涂色
+    assert _blob_region(overlap, th).sum() == 0  # 双线重叠按线条
+
+    th_hi = _fill_ratio_from_sensitivity(100.0)
+    assert _blob_region(overlap, th_hi).sum() > 0  # 拉满：重叠也涂
+
+    th_lo = _fill_ratio_from_sensitivity(0.0)
+    assert _blob_region(eye, th_lo).sum() == 0  # 归零：眼睛也按线条

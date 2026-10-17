@@ -2,6 +2,9 @@
 
 纯 Python/numpy 实现，面向几百×几百像素规模：整体复杂度 O(W*H + N)，
 不使用全局最近邻等 O(n²) 结构。
+
+另含手绘模拟（trace_hand_drawn_paths）：先把线条区域骨架化为 1px
+中心线再沿走向分段绘制，附人类化的抖动与端点过冲。
 """
 
 from __future__ import annotations
@@ -174,6 +177,434 @@ def filter_strokes(
     if min_length <= 0:
         return strokes
     return [s for s in strokes if path_length(s) >= min_length]
+
+def trace_hand_drawn_paths(
+    mask: np.ndarray,
+    min_step: float = 2.0,
+    jitter: float = 0.4,
+    overshoot: float = 1.0,
+    seed: int = 2024,
+    pen_width: int = 1,
+    fill_sensitivity: float = 65.0,
+) -> list[list[tuple[int, int]]]:
+    """手绘模拟：沿线条走向的中心线绘制 + 粗色块排线填涂。
+
+    流程：形态学开运算把掩膜分成「线条区域」（宽度 < 约 9px）与
+    「粗色块区域」——
+
+    - 线条区域：骨架化为中心线，复用贪心追踪器沿走向运笔；
+    - 粗色块区域：按笔宽间距生成排线（牛耕式往返折线，像人涂阴影
+      一样尽量不抬笔），色块外围约 4px 的边界环留在线条区域里，
+      骨架化后自然成为色块的轮廓线（先描边再涂黑，符合人类习惯）。
+
+    两类笔画统一做弧长重采样 + 滑动平均平滑 + 人类化笔迹（低频
+    手抖、起笔提前与收笔过冲）+ 距离抽稀。随机效果用固定种子驱动：
+    同一掩膜每次结果完全一致（预览即实绘）。
+
+    Args:
+        mask: 二维 bool 数组，True 表示需要绘制的像素。
+        min_step: 抽稀最小步长（像素），<=0 表示不抽稀。
+        jitter: 手抖幅度（像素）：垂直于线条方向的低频偏移标准差。
+        overshoot: 端点过冲上限（像素）：进笔提前量约 0~0.8 倍、
+            收笔过冲约 0.3~1.0 倍。
+        seed: 随机种子（固定值保证结果可复现）。
+        pen_width: 画笔线宽（像素）：排线间距据此设定（留少量重叠
+            保证涂满）。
+        fill_sensitivity: 涂色灵敏度（0~100）：越大越多的粗笔画区域
+            被按色块排线涂色（如眯眼式的粗黑眼睛笔画），越小越严格
+            （只有大面积实心色块才涂色，线条交角/重叠一律按线条画）。
+
+    Returns:
+        笔画列表，每笔为 [(x, y), ...]（屏幕坐标系，x 在前）。
+    """
+    m = np.asarray(mask, dtype=bool)
+    if m.ndim != 2:
+        raise ValueError("mask 必须是二维数组")
+    if not m.any():
+        return []
+    rng = np.random.default_rng(seed)
+    strokes: list[list[tuple[int, int]]] = []
+
+    def _finalize(pts: list[tuple[float, float]]) -> None:
+        pts = _smooth_polyline(pts, window=5, passes=2)
+        pts = _humanize(pts, rng, jitter, overshoot)
+        pts = _thin_polyline(pts, min_step)
+        strokes.append([(int(round(x)), int(round(y))) for x, y in pts])
+
+    # ① 线条区域：骨架中心线沿走向运笔
+    blob = _blob_region(
+        m, _fill_ratio_from_sensitivity(fill_sensitivity)
+    )
+    line_region = m & ~blob
+    if line_region.any():
+        skel = _skeletonize(line_region)
+        if skel.any():
+            # 复用贪心追踪器沿骨架行走：方向延续、过交叉自然直行、
+            # 2px 梯格来回成一笔
+            for seg in trace_paths(skel, min_step=0.0):
+                _finalize(_resample_polyline(seg, spacing=1.0))
+
+    # ② 粗色块区域：排线填涂（先整体后局部，笔画顺序天然为先线后涂）
+    if blob.any():
+        step = max(1, int(round(pen_width - 0.3)))
+        for chain in _hatch_strokes(blob, step):
+            _finalize(_resample_polyline(chain, spacing=1.0))
+
+    return [s for s in strokes if s]
+
+
+def _skeletonize(mask: np.ndarray) -> np.ndarray:
+    """串行简单点细化：把线条区域收缩为 1~2px 中心线。
+
+    按 3-4 chamfer 距离（到背景）升序逐像素删除「简单点」——8 邻域
+    环的 Rutovitz 交叉数为 1（删除不改变局部连通性）。两条保护规则：
+
+    - 端点保留：存活邻居数 < 2 的像素不删（线条不缩短消失）；
+    - 中轴保护：不存在距离更深的存活邻居时不删（等距像素互相拆解
+      的「合法塌缩」在数学上被阻断——斜线/圆弧只剥到等距梯格为止）。
+
+    相比经典并行算法（Zhang-Suen 会把完美 45° 斜线整体腐蚀掉），
+    串行 + 距离序对任意角度稳健；偶数宽度线条留下 2px 梯格，由
+    _segment_skeleton 的真交叉判定按路径处理。
+    """
+    m = mask.copy()
+    if not m.any():
+        return m
+    h, w = m.shape
+    d = _chamfer_distance(m)
+
+    ys, xs = np.nonzero(m)
+    order = np.lexsort((ys, xs, d[ys, xs]))
+    for idx in order:
+        y, x = int(ys[idx]), int(xs[idx])
+        if not m[y, x]:
+            continue
+        ring: list[int] = []
+        deeper = False
+        for dy, dx in ((-1, 0), (-1, 1), (0, 1), (1, 1),
+                       (1, 0), (1, -1), (0, -1), (-1, -1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and m[ny, nx]:
+                ring.append(1)
+                if d[ny, nx] > d[y, x]:
+                    deeper = True
+            else:
+                ring.append(0)
+        if sum(ring) < 2 or not deeper:
+            continue
+        cross = sum(
+            1 for i in range(8) if ring[i] == 0 and ring[(i + 1) % 8] == 1
+        )
+        if cross == 1:
+            m[y, x] = False
+    return m
+
+
+
+
+def _chamfer_distance(mask: np.ndarray) -> np.ndarray:
+    """3-4 chamfer 距离变换：每个前景像素到背景的距离（背景为 0）。
+
+    轴向步代价 3、对角步代价 4，约为欧氏距离的 3.5 倍。迭代 8 邻域
+    min+代价传播直到收敛（掩膜线宽有限，通常几轮即稳定）。
+    """
+    h, w = mask.shape
+    inf = 1 << 20
+    d = np.where(mask, inf, 0).astype(np.int32)
+    for _ in range(max(h, w)):
+        prev = d.copy()
+        md = d.copy()
+        for dy, dx, cost in (
+            (0, -1, 3), (0, 1, 3), (-1, 0, 3), (1, 0, 3),
+            (-1, -1, 4), (-1, 1, 4), (1, -1, 4), (1, 1, 4),
+        ):
+            shifted = np.full_like(d, inf)
+            ys0, ys1 = max(0, -dy), min(h, h - dy)
+            xs0, xs1 = max(0, -dx), min(w, w - dx)
+            shifted[ys0:ys1, xs0:xs1] = np.minimum(
+                inf, d[ys0 + dy : ys1 + dy, xs0 + dx : xs1 + dx] + cost
+            )
+            md = np.minimum(md, shifted)
+        d = md
+        if (d == prev).all():
+            break
+    return d
+
+
+#: 色块判定：chamfer 距离达到该值的像素构成「色块核」（约对应
+#: ≥9px 宽；更细的结构一律按线条骨架运笔）
+_FILL_MIN_CHAMFER = 15
+#: 色块核膨胀回原尺寸的迭代轮数（8 邻域，每轮 1px）
+_FILL_DILATE_ROUNDS = 4
+#: 色块核连通分量的最小面积（过滤发尖角这类零星加厚）
+_FILL_MIN_CORE_AREA = 16
+#: 上下文判定的包围盒外扩半径：真色块的核心在其邻域掩膜中占主导；
+#: 线条交角/双线重叠处的加厚核心周围线条像素占比高
+_FILL_CONTEXT_RADIUS = 16
+#: 涂色灵敏度（0~100，默认 65）→ 邻域核心占比阈值的映射：
+#: 阈值 = 0.5 − 0.45·灵敏度/100，即 0 → 0.5（最严格，只有大面积
+#: 色块才涂）、100 → 0.05（最宽松，宽度达标即涂）。实测「眯眼式」
+#: 粗笔画弧占比约 0.20~0.25、双线重叠约 0.19，两者接近——无法用
+#: 固定阈值同时满足，故开放为用户可调。
+_FILL_SENS_DEFAULT = 65.0
+
+
+def _fill_ratio_from_sensitivity(sensitivity: float) -> float:
+    """涂色灵敏度（0~100）映射为邻域核心占比阈值（0.05~0.5，反比）。"""
+    s = min(100.0, max(0.0, float(sensitivity)))
+    return 0.5 - 0.45 * s / 100.0
+
+
+def _blob_region(
+    mask: np.ndarray, ratio_threshold: float | None = None
+) -> np.ndarray:
+    """提取「粗色块」区域（需要排线填涂的部分）。
+
+    距离达到 _FILL_MIN_CHAMFER 的像素构成色块核（= 按半径腐蚀，
+    细线条整条消失）。对每个核连通分量再做两道上下文判定，剔除
+    「局部加厚」的假色块——真色块的核心在其邻域掩膜中占主导面积，
+    而发尖角内侧、两条线短距离重叠等加厚处的核心面积小且周围
+    线条像素占绝大多数，应按线条运笔：
+
+    - 核面积 ≥ _FILL_MIN_CORE_AREA；
+    - 邻域包围盒内（核面积 / 掩膜像素数）≥ _FILL_CONTEXT_RATIO
+      （占比按包围盒内全部核像素计，避免大色块的碎核被误杀）。
+
+    通过判定的核膨胀回原尺寸后与原掩膜相交；返回区域与线条区域
+    （mask 减本区域）互补。
+    """
+    d = _chamfer_distance(mask)
+    core = d >= _FILL_MIN_CHAMFER
+    if not core.any():
+        return np.zeros_like(mask)
+
+    if ratio_threshold is None:
+        ratio_threshold = _fill_ratio_from_sensitivity(_FILL_SENS_DEFAULT)
+    h, w = mask.shape
+    kept = np.zeros((h, w), dtype=bool)
+    for ys, xs in _core_components(core):
+        area = len(xs)
+        if area < _FILL_MIN_CORE_AREA:
+            continue
+        y0 = max(0, int(ys.min()) - _FILL_CONTEXT_RADIUS)
+        y1 = min(h, int(ys.max()) + 1 + _FILL_CONTEXT_RADIUS)
+        x0 = max(0, int(xs.min()) - _FILL_CONTEXT_RADIUS)
+        x1 = min(w, int(xs.max()) + 1 + _FILL_CONTEXT_RADIUS)
+        box_mask = int(mask[y0:y1, x0:x1].sum())
+        if box_mask <= 0:
+            continue
+        box_core = int(core[y0:y1, x0:x1].sum())
+        if box_core / box_mask < ratio_threshold:
+            continue  # 邻域内线条占主导：交角/重叠的局部加厚，按线条画
+        kept[ys, xs] = True
+    if not kept.any():
+        return np.zeros_like(mask)
+
+    grown = kept
+    for _ in range(_FILL_DILATE_ROUNDS):
+        nxt = grown.copy()
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx or dy:
+                    shifted = np.zeros((h, w), dtype=bool)
+                    ys0, ys1 = max(0, -dy), min(h, h - dy)
+                    xs0, xs1 = max(0, -dx), min(w, w - dx)
+                    shifted[ys0:ys1, xs0:xs1] = grown[
+                        ys0 + dy : ys1 + dy, xs0 + dx : xs1 + dx
+                    ]
+                    nxt |= shifted
+        grown = nxt
+    return mask & grown
+
+
+def _core_components(core: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    """色块核的 8 连通分量（返回每组的 (ys, xs) 坐标数组）。
+
+    核像素通常只有几百个（腐蚀后仅剩粗区域中心），BFS 足够快。
+    """
+    h, w = core.shape
+    remaining = core.copy()
+    out: list[tuple[np.ndarray, np.ndarray]] = []
+    ys, xs = np.nonzero(remaining)
+    for y0, x0 in zip(ys, xs):
+        if not remaining[y0, x0]:
+            continue
+        stack = [(int(y0), int(x0))]
+        remaining[y0, x0] = False
+        comp_ys: list[int] = []
+        comp_xs: list[int] = []
+        while stack:
+            cy, cx = stack.pop()
+            comp_ys.append(cy)
+            comp_xs.append(cx)
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < h and 0 <= nx < w and remaining[ny, nx]:
+                        remaining[ny, nx] = False
+                        stack.append((ny, nx))
+        out.append((np.asarray(comp_ys), np.asarray(comp_xs)))
+    return out
+
+
+def _hatch_strokes(
+    region: np.ndarray, step: int
+) -> list[list[tuple[float, float]]]:
+    """把色块区域转为排线填涂笔画（人类涂黑式的往复折线）。
+
+    按步长逐行取区域的连续段生成横线，相邻行的段首尾相接成一笔
+    （牛耕式往返：偶数行从左到右、奇数行从右到左），接不上的地方
+    才抬笔另起——尽量像人涂阴影一样不抬笔。返回折线（接笔处为
+    斜线，画在已涂区域上不留痕迹）。
+    """
+    h, w = region.shape
+    chains: list[list[tuple[float, float]]] = []
+    current: list[tuple[float, float]] = []
+    last_end: tuple[float, float] | None = None
+    step = max(1, int(step))
+    for y in range(0, h, step):
+        row = region[y]
+        if not row.any():
+            continue
+        padded = np.zeros(w + 2, dtype=bool)
+        padded[1:-1] = row
+        starts = np.flatnonzero(~padded[:-1] & padded[1:])  # 段起点（原坐标）
+        ends = np.flatnonzero(padded[:-1] & ~padded[1:]) - 1  # 段终点
+        segs = list(zip(starts.tolist(), ends.tolist()))
+        if y // step % 2 == 1:
+            segs.reverse()  # 奇数行反向（牛耕式）
+        for x0, x1 in segs:
+            a, b = (float(x0), float(y)), (float(x1), float(y))
+            if last_end is None or (
+                (a[0] - last_end[0]) ** 2 + (a[1] - last_end[1]) ** 2
+                > (2.2 * step + 3) ** 2
+            ):
+                if current:
+                    chains.append(current)
+                current = [a, b]
+            else:
+                current.extend([a, b])
+            last_end = b
+    if current:
+        chains.append(current)
+    return chains
+
+
+def _resample_polyline(
+    points: Sequence[tuple[float, float]],
+    spacing: float,
+) -> list[tuple[float, float]]:
+    """沿折线按弧长以 spacing 间距均匀重采样（首尾点保留）。"""
+    if len(points) < 2:
+        return [(float(p[0]), float(p[1])) for p in points]
+    out = [(float(points[0][0]), float(points[0][1]))]
+    carry = 0.0  # 段起点距上一个已输出采样点的弧长
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        seg = math.hypot(x1 - x0, y1 - y0)
+        if seg <= 0:
+            continue
+        ux, uy = (x1 - x0) / seg, (y1 - y0) / seg
+        d = spacing - carry
+        while d <= seg:
+            out.append((x0 + ux * d, y0 + uy * d))
+            d += spacing
+        carry = (carry + seg) % spacing
+    out.append((float(points[-1][0]), float(points[-1][1])))
+    return out
+
+
+def _smooth_polyline(
+    points: list[tuple[float, float]],
+    window: int = 5,
+    passes: int = 2,
+) -> list[tuple[float, float]]:
+    """滑动平均平滑（端点保持不动），去掉像素级阶梯锯齿。"""
+    if len(points) < 3 or window < 2:
+        return list(points)
+    half = window // 2
+    out = list(points)
+    for _ in range(passes):
+        arr = np.asarray(out, dtype=np.float64)
+        padded = np.pad(arr, ((half, half), (0, 0)), mode="edge")
+        cum = np.cumsum(padded, axis=0)
+        sums = cum[window - 1 :] - np.vstack(
+            [np.zeros((1, 2)), cum[: -window]]
+        )
+        smoothed = sums / window
+        smoothed[0] = arr[0]
+        smoothed[-1] = arr[-1]
+        out = [tuple(p) for p in smoothed]
+    return out
+
+
+def _humanize(
+    points: list[tuple[float, float]],
+    rng: np.random.Generator,
+    jitter: float,
+    overshoot: float,
+) -> list[tuple[float, float]]:
+    """给平滑后的中心线加人类笔迹特征：低频手抖 + 端点过冲。"""
+    if len(points) < 4 or (jitter <= 0 and overshoot <= 0):
+        # 点太少（如孤立短线段）没有可扰动的形状，只做过冲
+        if len(points) == 2 and overshoot > 0:
+            arr = np.asarray(points, dtype=np.float64)
+            t = arr[-1] - arr[0]
+            nrm = math.hypot(*t)
+            if nrm > 1e-9:
+                arr[0] = arr[0] - t / nrm * overshoot * 0.4
+                arr[-1] = arr[-1] + t / nrm * overshoot * 0.6
+                return [tuple(p) for p in arr]
+        return list(points)
+    arr = np.asarray(points, dtype=np.float64)
+    n = len(arr)
+    if jitter > 0:
+        # 控制点噪声 → 沿索引插值 → 再平滑，得到低频漂移
+        ctrl = rng.normal(0.0, 1.0, max(2, math.ceil(n / 9) + 1))
+        offsets = np.interp(
+            np.linspace(0.0, 1.0, n),
+            np.linspace(0.0, 1.0, len(ctrl)),
+            ctrl,
+        )
+        offsets = np.convolve(offsets, np.ones(3) / 3.0, mode="same") * jitter
+        tangents = np.gradient(arr, axis=0)
+        norm = np.hypot(tangents[:, 0], tangents[:, 1])
+        norm[norm < 1e-9] = 1.0
+        normals = np.stack(
+            [-tangents[:, 1] / norm, tangents[:, 0] / norm], axis=1
+        )
+        arr = arr + normals * offsets[:, None]
+    if overshoot > 0:
+        # 进笔提前（0~0.8 倍）与收笔过冲（0.3~1.0 倍）：沿端点切线向外延伸
+        t0 = arr[0] - arr[1]
+        n0 = math.hypot(*t0)
+        t1 = arr[-1] - arr[-2]
+        n1 = math.hypot(*t1)
+        if n0 > 1e-9:
+            pre = t0 / n0 * overshoot * rng.uniform(0.0, 0.8)
+            arr[0] = arr[0] + pre
+        if n1 > 1e-9:
+            post = t1 / n1 * overshoot * rng.uniform(0.3, 1.0)
+            arr[-1] = arr[-1] + post
+    return [tuple(p) for p in arr]
+
+
+def _thin_polyline(
+    points: list[tuple[float, float]],
+    min_step: float,
+) -> list[tuple[float, float]]:
+    """按最小步长抽稀（首尾点保留；平滑后的曲线无需保留拐点）。"""
+    if min_step <= 0 or len(points) <= 2:
+        return list(points)
+    limit_sq = min_step * min_step
+    kept = [points[0]]
+    for p in points[1:-1]:
+        lx, ly = kept[-1]
+        if (p[0] - lx) ** 2 + (p[1] - ly) ** 2 >= limit_sq:
+            kept.append(p)
+    if points[-1] != kept[-1]:
+        kept.append(points[-1])
+    return kept
+
 
 def _band_offsets(radius: float) -> list[tuple[int, int]]:
     """笔刷覆盖带相对中心点的像素偏移（圆形，半径 radius）。"""
