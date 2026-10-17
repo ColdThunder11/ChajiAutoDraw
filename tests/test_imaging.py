@@ -138,7 +138,9 @@ def test_binarize_line_mode_shapes_and_content() -> None:
     img = Image.new("L", (100, 100), 255)
     d = ImageDraw.Draw(img)
     d.line([(20, 10), (20, 90)], fill=0, width=2)
-    params = BinarizeParams(line_mode=True, line_threshold=10.0)
+    params = BinarizeParams(
+        line_mode=True, line_threshold=10.0, reject_shadow=True
+    )
     mask, offset = binarize(img, params, target_w=50, target_h=50)
     assert mask.shape == (50, 50)
     assert offset == (0, 0)  # 100x100 → 50x50 等比，无 letterbox
@@ -152,8 +154,9 @@ def test_binarize_params_line_mode_defaults_off() -> None:
     params = BinarizeParams()
     assert params.line_mode is False
     assert params.line_threshold == 12.0
-    assert params.reject_shadow is True  # 阴影剔除默认开启
+    assert params.reject_shadow is False  # 阴影剔除默认关闭
     assert params.shadow_protection == 40.0  # 默认强度 40
+    assert params.full_res_detect is True  # 全分辨率处理默认开启
 
 
 # ---- 线条模式阴影剔除（过滤光影分界线）----
@@ -205,7 +208,9 @@ def test_line_mode_rejects_same_hue_shadow_edge() -> None:
     raw = extract_line_mask(gray, sensitivity=10.0, rgb=rgb, reject_shadow=False)
     assert _edge_region(raw) > 0  # 前提：边界本来会被当线条检出
 
-    mask = extract_line_mask(gray, sensitivity=10.0, rgb=rgb)
+    mask = extract_line_mask(
+        gray, sensitivity=10.0, rgb=rgb, reject_shadow=True
+    )
     assert _line_region(mask) > 0  # 真实线条保留
     assert _edge_region(mask) == 0  # 光影分界线被滤除
 
@@ -215,7 +220,9 @@ def test_line_mode_rejects_strong_same_hue_shadow() -> None:
     from chaji_autodraw.core.imaging import extract_line_mask
 
     rgb, gray = _line_and_shadow_image((255, 228, 214), _SKIN_STRONG)
-    mask = extract_line_mask(gray, sensitivity=10.0, rgb=rgb)
+    mask = extract_line_mask(
+        gray, sensitivity=10.0, rgb=rgb, reject_shadow=True
+    )
     assert _line_region(mask) > 0
     assert _edge_region(mask) == 0
 
@@ -225,7 +232,9 @@ def test_line_mode_keeps_material_boundary_with_similar_hue() -> None:
     from chaji_autodraw.core.imaging import extract_line_mask
 
     rgb, gray = _line_and_shadow_image((255, 228, 214), _HAIR)
-    mask = extract_line_mask(gray, sensitivity=10.0, rgb=rgb)
+    mask = extract_line_mask(
+        gray, sensitivity=10.0, rgb=rgb, reject_shadow=True
+    )
     assert _line_region(mask) > 0
     assert _edge_region(mask) > 0  # 发际线不是阴影，应保留
 
@@ -235,7 +244,9 @@ def test_line_mode_keeps_dark_region_boundary() -> None:
     from chaji_autodraw.core.imaging import extract_line_mask
 
     rgb, gray = _line_and_shadow_image((255, 255, 255), _NAVY)
-    mask = extract_line_mask(gray, sensitivity=10.0, rgb=rgb)
+    mask = extract_line_mask(
+        gray, sensitivity=10.0, rgb=rgb, reject_shadow=True
+    )
     assert _line_region(mask) > 0
     assert _edge_region(mask) > 0
 
@@ -245,12 +256,16 @@ def test_line_mode_without_rgb_keeps_high_contrast_edge() -> None:
     from chaji_autodraw.core.imaging import extract_line_mask
 
     _, gray = _line_and_shadow_image((255, 255, 255), _NAVY)
-    mask = extract_line_mask(gray, sensitivity=10.0, rgb=None)
+    mask = extract_line_mask(
+        gray, sensitivity=10.0, rgb=None, reject_shadow=True
+    )
     assert _line_region(mask) > 0
     assert _edge_region(mask) > 0
 
     _, gray2 = _line_and_shadow_image(_SKIN, _SKIN_SHADOW)
-    mask2 = extract_line_mask(gray2, sensitivity=10.0, rgb=None)
+    mask2 = extract_line_mask(
+        gray2, sensitivity=10.0, rgb=None, reject_shadow=True
+    )
     assert _edge_region(mask2) == 0  # 灰度下低对比分界同样被滤除
 
 
@@ -274,7 +289,8 @@ def test_line_mode_keeps_pale_region_boundary() -> None:
 
     rgb, gray = _line_and_shadow_image((255, 255, 255), (230, 215, 150))
     mask = extract_line_mask(
-        gray, sensitivity=10.0, rgb=rgb, shadow_protection=50.0
+        gray, sensitivity=10.0, rgb=rgb, reject_shadow=True,
+        shadow_protection=50.0,
     )
     assert _line_region(mask) > 0
     assert _edge_region(mask) > 0
@@ -292,7 +308,9 @@ def test_line_mode_keeps_interior_detail_lines() -> None:
     d.rectangle([100, 0, 200, 140], fill=(210, 180, 160))  # 中调肤色区域
     for x in range(108, 200, 10):  # 区域内部同色度发丝线
         d.line([(x, 5), (x, 135)], fill=(160, 130, 115), width=2)
-    mask = extract_line_mask(img.convert("L"), sensitivity=10.0, rgb=img)
+    mask = extract_line_mask(
+        img.convert("L"), sensitivity=10.0, rgb=img, reject_shadow=True
+    )
     assert mask[20:120, 102:200].sum() > 0  # 内部发丝线保留
     # 区域边界（x≈100-105，第一条发丝线在 x=108 之前）是同色度阶跃 → 滤除
     assert mask[20:120, 100:106].sum() == 0
@@ -306,7 +324,9 @@ def test_line_mode_keeps_dense_hatching() -> None:
     d = ImageDraw.Draw(img)
     for x in range(20, 180, 6):
         d.line([(x, 5), (x, 135)], fill=0, width=2)
-    mask = extract_line_mask(img.convert("L"), sensitivity=10.0, rgb=img)
+    mask = extract_line_mask(
+        img.convert("L"), sensitivity=10.0, rgb=img, reject_shadow=True
+    )
     assert mask[10:130, 18:182].sum() > 0
 
 
@@ -316,7 +336,8 @@ def test_shadow_protection_strict_keeps_same_hue_shadow() -> None:
 
     rgb, gray = _line_and_shadow_image((255, 228, 214), _SKIN_STRONG)
     mask = extract_line_mask(
-        gray, sensitivity=10.0, rgb=rgb, shadow_protection=100.0
+        gray, sensitivity=10.0, rgb=rgb, reject_shadow=True,
+        shadow_protection=100.0,
     )
     assert _line_region(mask) > 0
     assert _edge_region(mask) > 0  # 高保护下同色阴影边界保留
@@ -332,12 +353,14 @@ def test_shadow_protection_loose_removes_tinted_shadow() -> None:
 
     rgb, gray = _line_and_shadow_image((255, 255, 255), (150, 175, 215))
     default = extract_line_mask(
-        gray, sensitivity=10.0, rgb=rgb, shadow_protection=50.0
+        gray, sensitivity=10.0, rgb=rgb, reject_shadow=True,
+        shadow_protection=50.0,
     )
     assert _edge_region(default) > 0  # 标准强度 50：色偏明显 → 保留
 
     loose = extract_line_mask(
-        gray, sensitivity=10.0, rgb=rgb, shadow_protection=0.0
+        gray, sensitivity=10.0, rgb=rgb, reject_shadow=True,
+        shadow_protection=0.0,
     )
     assert _line_region(loose) > 0
     assert _edge_region(loose) == 0  # 激进强度：被滤除
@@ -349,7 +372,8 @@ def test_shadow_protection_strict_keeps_gray_shadow_edge() -> None:
 
     _, gray = _line_and_shadow_image(_SKIN, _SKIN_SHADOW)
     mask = extract_line_mask(
-        gray, sensitivity=10.0, rgb=None, shadow_protection=100.0
+        gray, sensitivity=10.0, rgb=None, reject_shadow=True,
+        shadow_protection=100.0,
     )
     assert _line_region(mask) > 0
     assert _edge_region(mask) > 0  # Δ≈65 高于最保守的对比度阈值 40
@@ -368,7 +392,9 @@ def test_line_mode_full_res_detection_survives_downscale() -> None:
     d = ImageDraw.Draw(img)
     d.rectangle([100, 0, 132, 560], fill=(200, 200, 200))  # 32px 同色度阴影带
     d.line([(400, 20), (400, 540)], fill=0, width=8)  # → 画布 2px 黑线
-    params = BinarizeParams(line_mode=True, line_threshold=10.0)
+    params = BinarizeParams(
+        line_mode=True, line_threshold=10.0, reject_shadow=True
+    )
     mask, offset = binarize(
         img.convert("L"), params, target_w=200, target_h=140, rgb=img
     )
@@ -380,6 +406,31 @@ def test_line_mode_full_res_detection_survives_downscale() -> None:
     assert mask[20:120, 18:42].sum() == 0
 
 
+def test_line_mode_scaled_detect_restores_old_behavior() -> None:
+    """关闭全分辨率处理：回到先缩放后检测的旧行为（窄阴影带漏判）。
+
+    与 test_line_mode_full_res_detection_survives_downscale 互为对照：
+    同一张图，full_res_detect=True 窄阴影带被正确剔除；False 时缩放
+    后暗带比结构元窄，边界泄漏成多余线条（旧行为的已知缺陷）。
+    """
+    from chaji_autodraw.core.imaging import BinarizeParams, binarize
+
+    img = Image.new("RGB", (800, 560), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    d.rectangle([100, 0, 132, 560], fill=(200, 200, 200))  # 32px 同色度阴影带
+    d.line([(400, 20), (400, 540)], fill=0, width=8)
+    params = BinarizeParams(
+        line_mode=True, line_threshold=10.0, reject_shadow=True,
+        full_res_detect=False,
+    )
+    mask, _ = binarize(
+        img.convert("L"), params, target_w=200, target_h=140, rgb=img
+    )
+
+    assert mask[20:120, 96:105].sum() > 0  # 线条仍保留
+    assert mask[20:120, 18:42].sum() > 0  # 阴影带边界泄漏（旧行为）
+
+
 def test_binarize_line_mode_resizes_rgb_for_shadow_reject() -> None:
     """binarize 集成：rgb 随灰度同步缩放，缩放后阴影仍被滤除、线条保留。"""
     from chaji_autodraw.core.imaging import BinarizeParams, binarize
@@ -388,7 +439,9 @@ def test_binarize_line_mode_resizes_rgb_for_shadow_reject() -> None:
     d = ImageDraw.Draw(img)
     d.line([(60, 16), (60, 264)], fill=20, width=10)
     d.rectangle([220, 0, 400, 280], fill=_SKIN_SHADOW)
-    params = BinarizeParams(line_mode=True, line_threshold=10.0)
+    params = BinarizeParams(
+        line_mode=True, line_threshold=10.0, reject_shadow=True
+    )
     mask, offset = binarize(
         img.convert("L"), params, target_w=200, target_h=140, rgb=img
     )

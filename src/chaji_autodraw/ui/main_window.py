@@ -80,7 +80,7 @@ _LABEL_TIPS: dict[str, str] = {
         "显著减少落笔次数；过大会把本应分离的线条连在一起。",
     "线条阈值": "线条模式的检测灵敏度（1~60）：越小线条越多越密，越大只保留最深的线。"
         "仅在线条模式下生效。",
-    "阴影剔除": "仅线条模式：识别并剔除光影分界线，防止把阴影边缘当成线条画出（默认开启）。"
+    "阴影剔除": "仅线条模式：识别并剔除光影分界线，防止把阴影边缘当成线条画出（默认关闭，勾选开启）。"
         "三道判据全部满足才删除：几何上是阶跃边缘而非线条（没有任何方向两侧恢复亮背景）、"
         "邻近宽暗区、两侧色度一致（同一材质被整体调暗的光照变化）。"
         "因此发色/肤色等材质分界线、浅色低对比的边界、阴影区域内部的细节线、密集排线都会保留；"
@@ -90,6 +90,10 @@ _LABEL_TIPS: dict[str, str] = {
         "完全一致、明暗落差很小的分界才被当成阴影滤除，可能漏掉部分阴影边；值越小滤除越"
         "激进——色度容差与落差上限放宽，会滤除更多边界，也可能误删浅色材质分界线。"
         "50 为标准强度，默认取 40 略偏激进；若仍有线条被误删调大，若阴影边没滤干净调小。",
+    "全分辨率处理": "仅线条模式（默认开启）：DoG 线条检测与阴影剔除的全部滤波在原图全分辨率执行，"
+        "掩码再按面积覆盖率缩放到画布——框选画布前后检测效果一致，窄阴影带不会因缩放漏判、"
+        "细线不丢失。关闭后与旧版相同：先把图片缩放到画布分辨率再检测，超大图上更快，"
+        "但缩放可能改变阴影剔除的几何判定（阴影边界可能漏滤成多余线条）。",
     "窗口关键词": "窗口标题包含该文字才会被检测，例如“霸王茶姬”。",
     "进程名": "窗口须属于该进程（默认 WeChatAppEx.exe，微信小程序）才会自动选中；"
         "多个同进程窗口时取面积最大的主窗口。留空则仅按标题匹配。",
@@ -366,16 +370,21 @@ class MainWindow(QMainWindow):
             "只画线条不涂色块；开启后「阈值/反相」不参与，线条色块将不再被涂黑。"
         )
         line_row.addWidget(self._line_mode_check)
+        # 全分辨率处理：线条模式检测（DoG+阴影剔除）在原图分辨率执行
+        self._fullres_check = QCheckBox("全分辨率处理", form_area)
+        self._fullres_check.setChecked(True)
+        self._fullres_check.setToolTip(_LABEL_TIPS["全分辨率处理"])
+        line_row.addWidget(self._fullres_check)
         self._line_thresh_label = _tip_label("线条阈值", form_area)
         line_row.addWidget(self._line_thresh_label)
         self._line_thresh_spin = QSpinBox(form_area)
         self._line_thresh_spin.setRange(1, 60)
         self._line_thresh_spin.setValue(12)
         line_row.addWidget(self._line_thresh_spin)
-        # 阴影剔除：过滤光影分界线（线条模式下默认开启，可关）；
+        # 阴影剔除：过滤光影分界线（默认关闭，可勾选开启）；
         # 右侧紧跟「保护强度」短滑条
         self._shadow_check = QCheckBox("阴影剔除", form_area)
-        self._shadow_check.setChecked(True)
+        self._shadow_check.setChecked(False)
         self._shadow_check.setToolTip(_LABEL_TIPS["阴影剔除"])
         line_row.addWidget(self._shadow_check)
         self._shadow_prot_label = _tip_label("保护强度", form_area)
@@ -515,6 +524,7 @@ class MainWindow(QMainWindow):
         self._shadow_check.toggled.connect(self._on_params_changed)
         self._shadow_check.toggled.connect(self._sync_shadow_prot_enabled)
         self._shadow_prot_slider.valueChanged.connect(self._on_params_changed)
+        self._fullres_check.toggled.connect(self._on_params_changed)
         self._invert_check.toggled.connect(self._on_params_changed)
         # 右栏
         self._detect_btn.clicked.connect(self._detect_windows)
@@ -535,6 +545,7 @@ class MainWindow(QMainWindow):
             line_threshold=float(self._line_thresh_spin.value()),
             reject_shadow=self._shadow_check.isChecked(),
             shadow_protection=float(self._shadow_prot_slider.value()),
+            full_res_detect=self._fullres_check.isChecked(),
             invert=self._invert_check.isChecked(),
         )
 
@@ -562,6 +573,7 @@ class MainWindow(QMainWindow):
         self._line_thresh_spin.setEnabled(checked)
         self._line_thresh_label.setEnabled(checked)
         self._shadow_check.setEnabled(checked)
+        self._fullres_check.setEnabled(checked)
         self._sync_shadow_prot_enabled()
         self._on_params_changed()
 
