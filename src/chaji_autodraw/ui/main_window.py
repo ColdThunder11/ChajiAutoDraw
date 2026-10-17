@@ -80,6 +80,16 @@ _LABEL_TIPS: dict[str, str] = {
         "显著减少落笔次数；过大会把本应分离的线条连在一起。",
     "线条阈值": "线条模式的检测灵敏度（1~60）：越小线条越多越密，越大只保留最深的线。"
         "仅在线条模式下生效。",
+    "阴影剔除": "仅线条模式：识别并剔除光影分界线，防止把阴影边缘当成线条画出（默认开启）。"
+        "三道判据全部满足才删除：几何上是阶跃边缘而非线条（没有任何方向两侧恢复亮背景）、"
+        "邻近宽暗区、两侧色度一致（同一材质被整体调暗的光照变化）。"
+        "因此发色/肤色等材质分界线、浅色低对比的边界、阴影区域内部的细节线、密集排线都会保留；"
+        "带明显冷暖色偏的阴影可能不被滤除，可关闭本项找回旧行为。"
+        "注意：超过 300 万像素的大图加载时会默认关闭本项（滤波开销大，防卡顿），可手动勾选。",
+    "保护强度": "阴影剔除的保守程度（0~100，默认 40）：值越大越重视保留线条——只有色度几乎"
+        "完全一致、明暗落差很小的分界才被当成阴影滤除，可能漏掉部分阴影边；值越小滤除越"
+        "激进——色度容差与落差上限放宽，会滤除更多边界，也可能误删浅色材质分界线。"
+        "50 为标准强度，默认取 40 略偏激进；若仍有线条被误删调大，若阴影边没滤干净调小。",
     "窗口关键词": "窗口标题包含该文字才会被检测，例如“霸王茶姬”。",
     "进程名": "窗口须属于该进程（默认 WeChatAppEx.exe，微信小程序）才会自动选中；"
         "多个同进程窗口时取面积最大的主窗口。留空则仅按标题匹配。",
@@ -107,6 +117,8 @@ def _tip_label(text: str, parent: QWidget | None = None) -> QLabel:
 _RISKY_STROKE_PX = 4.0
 #: 笔画数超过该值时，小程序可能在保存时崩溃
 _STROKE_COUNT_WARN = 2000
+#: 超过该像素数的大图默认关闭阴影剔除（形态学滤波开销大，防加载卡顿）
+_LARGE_IMAGE_PIXELS = 3_000_000
 #: 绘制速度档位 → (每步延时秒, 笔间停顿秒)
 _SPEED_TABLE: dict[str, tuple[float, float]] = {
     "0.25x": (0.024, 0.010),
@@ -193,6 +205,7 @@ class MainWindow(QMainWindow):
         # ---- 运行状态 ----
         self._image_path: str | None = None
         self._gray: PILImage.Image | None = None  # 原图灰度版（用于二值化）
+        self._rgb: PILImage.Image | None = None  # 原图彩色版（线条模式阴影剔除用）
         self._window: WindowInfo | None = None  # 当前选中的目标窗口
         self._canvas_rel: QRect | None = None  # 画布相对窗口左上角的矩形
         self._bounds_at_pick: tuple[int, int, int, int] | None = None  # 框选时窗口 bounds
@@ -302,9 +315,9 @@ class MainWindow(QMainWindow):
         )
         form.addWidget(self._invert_check)
 
-        # 实验性：短笔画重复拖拽（防位移过短画布不落笔）
+        # 短笔画重复拖拽（防位移过短画布不落笔）
         exp_row = QHBoxLayout()
-        self._mindrag_check = QCheckBox("实验：短笔画延伸拖拽", form_area)
+        self._mindrag_check = QCheckBox("短笔画延伸拖拽", form_area)
         self._mindrag_check.setChecked(True)
         self._mindrag_check.setToolTip(
             "画布按「按下点到最远拖拽点」的距离判定有效笔画。路径长度不足"
@@ -323,9 +336,9 @@ class MainWindow(QMainWindow):
         self._mindrag_check.toggled.connect(self._mindrag_spin.setEnabled)
         form_col.addLayout(exp_row)
 
-        # 实验性：自动连接相近线条（减少落笔次数）
+        # 自动连接相近线条（减少落笔次数）
         conn_row = QHBoxLayout()
-        self._connect_check = QCheckBox("实验：自动连接相近线条", form_area)
+        self._connect_check = QCheckBox("自动连接相近线条", form_area)
         self._connect_check.setChecked(True)
         self._connect_check.setToolTip(
             "端点距离不超过「连接距离」的相邻笔画首尾相连成一笔，"
@@ -359,9 +372,29 @@ class MainWindow(QMainWindow):
         self._line_thresh_spin.setRange(1, 60)
         self._line_thresh_spin.setValue(12)
         line_row.addWidget(self._line_thresh_spin)
+        # 阴影剔除：过滤光影分界线（线条模式下默认开启，可关）；
+        # 右侧紧跟「保护强度」短滑条
+        self._shadow_check = QCheckBox("阴影剔除", form_area)
+        self._shadow_check.setChecked(True)
+        self._shadow_check.setToolTip(_LABEL_TIPS["阴影剔除"])
+        line_row.addWidget(self._shadow_check)
+        self._shadow_prot_label = _tip_label("保护强度", form_area)
+        line_row.addWidget(self._shadow_prot_label)
+        self._shadow_prot_slider = QSlider(Qt.Orientation.Horizontal, form_area)
+        self._shadow_prot_slider.setRange(0, 100)
+        self._shadow_prot_slider.setValue(40)
+        self._shadow_prot_slider.setFixedWidth(80)
+        line_row.addWidget(self._shadow_prot_slider)
+        self._shadow_prot_value = QLabel("40", form_area)
+        self._shadow_prot_value.setMinimumWidth(24)
+        line_row.addWidget(self._shadow_prot_value)
         line_row.addStretch(1)
         self._line_thresh_spin.setEnabled(False)
         self._line_thresh_label.setEnabled(False)
+        self._shadow_check.setEnabled(False)
+        self._shadow_prot_slider.setEnabled(False)
+        self._shadow_prot_label.setEnabled(False)
+        self._shadow_prot_value.setEnabled(False)
         form_col.addLayout(line_row)
 
         layout.addWidget(form_area)
@@ -443,7 +476,7 @@ class MainWindow(QMainWindow):
         self._backend_combo.addItems(
             (
                 "前台鼠标（移动真实光标）",
-                "后台消息（不动鼠标，窗口可被遮挡）",
+                "后台消息（窗口不可最小化）",
             )
         )
         self._backend_combo.setCurrentIndex(1)  # 默认后台消息
@@ -479,6 +512,9 @@ class MainWindow(QMainWindow):
         self._connect_gap_spin.valueChanged.connect(self._on_params_changed)
         self._line_mode_check.toggled.connect(self._on_line_mode_toggled)
         self._line_thresh_spin.valueChanged.connect(self._on_params_changed)
+        self._shadow_check.toggled.connect(self._on_params_changed)
+        self._shadow_check.toggled.connect(self._sync_shadow_prot_enabled)
+        self._shadow_prot_slider.valueChanged.connect(self._on_params_changed)
         self._invert_check.toggled.connect(self._on_params_changed)
         # 右栏
         self._detect_btn.clicked.connect(self._detect_windows)
@@ -497,14 +533,26 @@ class MainWindow(QMainWindow):
             blur_radius=self._blur_slider.value() / 10.0,
             line_mode=self._line_mode_check.isChecked(),
             line_threshold=float(self._line_thresh_spin.value()),
+            reject_shadow=self._shadow_check.isChecked(),
+            shadow_protection=float(self._shadow_prot_slider.value()),
             invert=self._invert_check.isChecked(),
         )
 
     def _sync_param_labels(self) -> None:
-        """刷新阈值/模糊/抽稀的数值标签。"""
+        """刷新阈值/模糊/抽稀/保护强度的数值标签。"""
         self._threshold_value.setText(str(self._threshold_slider.value()))
         self._blur_value.setText(f"{self._blur_slider.value() / 10.0:.1f}")
         self._thin_value.setText(f"{self._thin_slider.value()} px")
+        self._shadow_prot_value.setText(str(self._shadow_prot_slider.value()))
+
+    def _sync_shadow_prot_enabled(self) -> None:
+        """保护强度滑条仅在线条模式开启且勾选阴影剔除时可用。"""
+        enabled = (
+            self._line_mode_check.isChecked() and self._shadow_check.isChecked()
+        )
+        self._shadow_prot_slider.setEnabled(enabled)
+        self._shadow_prot_label.setEnabled(enabled)
+        self._shadow_prot_value.setEnabled(enabled)
 
     def _on_line_mode_toggled(self, checked: bool) -> None:
         """线条模式开关：切换可用控件并刷新预览。"""
@@ -513,6 +561,8 @@ class MainWindow(QMainWindow):
         self._invert_check.setEnabled(not checked)
         self._line_thresh_spin.setEnabled(checked)
         self._line_thresh_label.setEnabled(checked)
+        self._shadow_check.setEnabled(checked)
+        self._sync_shadow_prot_enabled()
         self._on_params_changed()
 
     def _on_params_changed(self) -> None:
@@ -534,19 +584,29 @@ class MainWindow(QMainWindow):
         try:
             self._gray = load_grayscale(path)
             with PILImage.open(path) as img:
-                original_pix = pil_to_pixmap(img.convert("RGB"))
+                rgb = img.convert("RGB")  # 转换副本，脱离文件句柄独立存在
+                original_pix = pil_to_pixmap(rgb)
                 colorful = is_colorful(img)
         except Exception as e:  # noqa: BLE001 - 用户选择的文件可能任意损坏
             QMessageBox.critical(self, "打开图片", f"无法读取图片：{e}")
             return
         self._image_path = path
+        self._rgb = rgb
         self._original_preview.set_image(original_pix)
+        # 超大图：线条模式检测（含阴影剔除滤波）在原图全分辨率执行，开销随
+        # 像素数线性增长，默认关闭阴影剔除防卡顿（在开启线条模式前设置，
+        # 避免首次预览就带滤镜重算）
+        huge = rgb.size[0] * rgb.size[1] > _LARGE_IMAGE_PIXELS
+        if huge:
+            self._shadow_check.setChecked(False)
         # 自动检测：大面积彩色（如二次元插画）→ 开启线条模式；灰度图 → 关闭
         self._line_mode_check.setChecked(colorful)
         self._update_binarize_preview()
         hint = (
             "（检测到大面积彩色，已自动开启线条模式）" if colorful else ""
         )
+        if huge:
+            hint += "（图片超过 300 万像素，已默认关闭阴影剔除防卡顿）"
         self.statusBar().showMessage(f"已加载图片：{path}{hint}", 8000)
 
     def _compute_strokes(
@@ -570,6 +630,7 @@ class MainWindow(QMainWindow):
             self._current_params(),
             target_w=target[0] if target else None,
             target_h=target[1] if target else None,
+            rgb=self._rgb,
         )
         strokes = trace_paths(mask, min_step=float(self._thin_slider.value()))
         if target is not None:
@@ -643,7 +704,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"二值化失败：{e}")
             return
         if target is None:
-            mask, _offset = binarize(self._gray, self._current_params())
+            mask, _offset = binarize(
+                self._gray, self._current_params(), rgb=self._rgb
+            )
             self._bin_preview.set_image(pil_to_pixmap(mask_to_preview(mask)))
             self._stroke_info.setText("未框选画布：预览为原图分辨率")
             self._risk_mode = False

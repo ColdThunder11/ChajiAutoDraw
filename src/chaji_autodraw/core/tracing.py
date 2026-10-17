@@ -315,7 +315,7 @@ def extend_short_strokes(
     min_length: float,
     mask: np.ndarray | None = None,
 ) -> list[list[tuple[int, int]]]:
-    """（实验性）把短笔画延伸为足量位移的拖拽，避免画布不落笔。
+    """把短笔画延伸为足量位移的拖拽，避免画布不落笔。
 
     小程序画布按「按下点到最远拖拽点的距离」判定笔画是否有效（约需
     3~4px），往返拖拽无法提高最远距离。因此短笔画沿最优方向**延伸**，
@@ -391,7 +391,7 @@ def connect_nearby_strokes(
     strokes: list[list[tuple[int, int]]],
     max_gap: float = 1.5,
 ) -> list[list[tuple[int, int]]]:
-    """（实验性）把端点相距不超过 max_gap 的相邻笔画首尾相连成一笔。
+    """把端点相距不超过 max_gap 的相邻笔画首尾相连成一笔。
 
     追踪器因贪心走不出去而拆开的笔画，其断点通常只差 1px；相连后可
     显著减少落笔（mouseDown/Up）次数。贪心链式合并：从任一笔画出发，
